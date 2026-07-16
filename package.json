@@ -1,0 +1,35 @@
+{
+  "name": "@doinn/capacitor-background-upload",
+  "version": "1.0.0",
+  "description": "Native background file upload for Capacitor. iOS: URLSession background sessions. Android: WorkManager + OkHttp with resumable upload support.",
+  "main": "src/index.js",
+  "files": [
+    "src/",
+    "ios/",
+    "android/",
+    "*.podspec"
+  ],
+  "author": "Doinn",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Doinn/capacitor-background-upload.git"
+  },
+  "scripts": {
+    "verify:android": "cd android && ./gradlew clean build",
+    "release:patch": "npm version patch && git push && git push --tags",
+    "release:minor": "npm version minor && git push && git push --tags",
+    "release:major": "npm version major && git push && git push --tags"
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  }
+}
