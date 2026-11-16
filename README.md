@@ -43,9 +43,11 @@ Deletes a file returned by `prepareFile` that was never enqueued. A path outside
 
 Queues a background upload. Resolves when the job is enqueued, not when it finishes — listen to events for completion.
 
+Enqueue each `jobId` once. On Android the job record is reset (`attempts` 0, `state` `queued`) before the work is enqueued with the KEEP policy, so enqueueing a `jobId` that already has work resets the record under that work. Use a new `jobId` for a new upload.
+
 ```js
 await BackgroundUpload.enqueueUpload({
-  jobId,             // string, required — unique id, used for dedup (KEEP policy)
+  jobId,             // string, required — unique id, enqueue each jobId only once
   filePath,          // string, required — path returned by prepareFile
   url,               // string, required — signed upload URL
   headers,           // object, optional — extra request headers
@@ -65,13 +67,19 @@ const { jobs } = await BackgroundUpload.getJobs()
 - `attempts` (Android only): number of counted attempts so far.
 - `createdAt` (Android only): time the job was enqueued, in milliseconds since the epoch.
 
+On iOS each job has only `jobId`, `state`, `bytesSent`, `totalBytes`, `httpStatus` and `error`.
+
 ### `acknowledge({ jobId })`
 
 Cancels any pending work for the job, removes its record from the store and deletes its prepared file from the cache dir. Call it after the app has confirmed the upload with the backend, or to drop a job that is no longer wanted.
 
+On iOS it removes the record and deletes the prepared file but does not cancel a task that is still running.
+
 ### `cancel({ jobId })`
 
-Marks the job `failed` with the error `cancelled` and cancels its work. A job that is already `uploaded` keeps that state. This is the only way a job ends as `failed` with the error `cancelled`.
+Marks the job `failed` with the error `cancelled` and cancels its work. A job that is already `uploaded` keeps that state. On Android this is the only way a job ends as `failed` with the error `cancelled`.
+
+On iOS it only cancels the running `URLSession` task. The record then fails through the normal completion path with the system's error message for a cancelled request, not the text `cancelled`, and `uploadFailed` is emitted.
 
 ### `cleanupOrphans({ maxAgeMs? })`
 
@@ -93,16 +101,18 @@ Meant to be called once per JavaScript start, before any upload. It removes ever
 | --- | --- |
 | `queued` | Not transferring. This covers a job that has not started, one waiting for the network, and one waiting between attempts. |
 | `uploading` | A transfer is running. |
-| `uploaded` | The server answered with a 2xx status. |
+| `uploaded` | The server answered with a 2xx status. On Android it can also be reached with `httpStatus` 308, when the resume probe finds the whole file already committed. |
 | `failed` | The job ended with an error, see `error` and `httpStatus`. |
+
+On iOS a job is `uploading` from the moment it is enqueued and never `queued`. A job whose task did not survive a force-quit is marked `failed` with the error `orphaned (app terminated)` on the first plugin call after launch.
 
 ### Retries (Android)
 
 - A transfer is attempted at most 5 times for retryable failures: HTTP 408, 429, any 5xx, 308 on the data request, and network errors while a network is available. Each of these consumes an attempt, and the job fails after the fifth.
-- Any other 4xx fails the job at once.
+- Every other HTTP status, including all other 4xx codes, fails the job at once, and so do errors that are not network errors, such as a missing file or a revoked `content://` grant.
 - A loss of connectivity does not consume an attempt. The job returns to `queued` and runs again once a network is available.
 - A stop by the system does not consume an attempt either. The job returns to `queued`.
-- A job that returns to `queued` without consuming an attempt is re-run about 5 seconds after it is rescheduled, once the network constraint is met. For GCS resumable sessions the transfer continues from the committed offset.
+- A job that returns to `queued` without consuming an attempt is re-run about 5 seconds after it is rescheduled, once the network constraint is met. A counted retry instead waits on WorkManager's linear backoff of 10 seconds times the run count of the work request. For GCS resumable sessions the transfer continues from the committed offset.
 
 ### Events
 
@@ -118,9 +128,9 @@ Events are best effort. They can be missed while the app is not running, and a t
 
 - A switch from Wi-Fi to mobile data breaks the connection while a network is still reported. That failure consumes an attempt.
 - On Android 12 and later, a job that starts or re-runs while the app is in the background may run without a foreground service, and the system may delay it.
-- Android limits the `dataSync` foreground service type to 6 hours in any 24.
+- For apps that target Android 15 (API 35) and later, Android limits the `dataSync` foreground service type to 6 hours in any 24. When the system stops the worker for that reason, the plugin handles it as any other stop by the system: the job goes back to `queued` without consuming an attempt.
 - The Doinn app does not route iOS uploads through this plugin in this version. On iOS the plugin creates no background session and does no work until the first call to one of its methods.
-- `getJobs` returns only `jobId`, `state`, `bytesSent`, `totalBytes`, `httpStatus` and `error` on iOS, and the retry rules above describe Android only.
+- The retry rules above describe Android only. On iOS any status outside 2xx, and any transport error, fails the job at once.
 
 ## Release
 
