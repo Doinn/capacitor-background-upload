@@ -16,12 +16,16 @@
     "url": "https://github.com/Doinn/capacitor-background-upload.git"
   },
   "scripts": {
-    "verify:android": "cd android && ./gradlew clean build",
+    "verify:android": "cd android && ./gradlew testDebugUnitTest assembleDebug",
     "release:patch": "npm version patch && git push && git push --tags",
     "release:minor": "npm version minor && git push && git push --tags",
     "release:major": "npm version major && git push && git push --tags"
   },
   "peerDependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^7.0.0",
     "@capacitor/core": "^7.0.0"
   },
   "capacitor": {
