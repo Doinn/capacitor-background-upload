@@ -40,12 +40,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         const val KEY_URL = "url"
         const val KEY_HEADERS = "headers"
         const val KEY_RESUME = "resume"
+        const val KEY_IDLE_WAITS = "idleWaits"
         const val KEY_NOTIFICATION_TITLE = "notificationTitle"
         const val KEY_PROGRESS_BYTES_SENT = "bytesSent"
         const val KEY_PROGRESS_TOTAL = "totalBytes"
         const val CHANNEL_ID = "doinn_background_upload"
         const val NOTIFICATION_ID_BASE = 42918
-        private const val REQUEUE_DELAY_SECONDS = 5L
         const val ORPHANED_ERROR = "orphaned"
         private const val TAG = "UploadWorker"
     }
@@ -137,7 +137,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             buildRequest(job)
         } catch (e: Exception) {
             val error = e.message ?: e.javaClass.simpleName
-            return settle(jobId) { UploadDecision.Failed(null, error, it.attempts) }
+            return settle(jobId, job.bytesSent) { UploadDecision.Failed(null, error, it.attempts) }
         }
         if (!record(jobId) { it.totalBytes = request.totalBytes }) return Result.failure()
 
@@ -146,7 +146,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             isCancelled = { isStopped || recordRemoved.get() },
             onProgress = { sent -> reportProgress(jobId, sent, request.totalBytes) }
         )
-        return settle(jobId) { decide(it.attempts, outcome, it.cancelRequested) }
+        return settle(jobId, job.bytesSent) { decide(it.attempts, outcome, it.cancelRequested) }
     }
 
     private fun buildRequest(job: UploadJob): TransferRequest {
@@ -211,8 +211,11 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
      * count of the same work, and every re-run raises it, so only a request with a run count of 0
      * keeps a job that merely waited for the network from being delayed. A counted retry keeps
      * `Result.retry()` so that its backoff applies.
+     *
+     * [bytesSentAtStart] is what the record held when this run began; whether the run moved past
+     * it decides how long the replacement waits, see [planRequeue].
      */
-    private fun settle(jobId: String, choose: (UploadJob) -> UploadDecision): Result {
+    private fun settle(jobId: String, bytesSentAtStart: Long, choose: (UploadJob) -> UploadDecision): Result {
         if (recordRemoved.get()) return Result.failure()
         var attemptsBefore = 0
         val settled = store.update(jobId) { job ->
@@ -245,7 +248,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             "uploaded" -> Result.success(output)
             "failed" -> Result.failure(output)
             else -> {
-                if (settled.attempts == attemptsBefore) replaceWithFreshRequest(jobId)
+                if (settled.attempts == attemptsBefore) {
+                    replaceWithFreshRequest(jobId, bytesSentAtStart, settled.bytesSent)
+                }
                 Result.retry()
             }
         }
@@ -256,15 +261,24 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
      * the enqueue must not be undone by it. The plugin records a cancel before it cancels the
      * work, so either that cancel sees this request or this check sees the cancel. A failure here
      * leaves `Result.retry()` as the fallback.
+     *
+     * The replacement carries the number of consecutive runs that moved no byte and waits longer
+     * for each of them, because the probe judges the default network while WorkManager judges the
+     * job's own, and the two can disagree for as long as the app stays hidden.
      */
-    private fun replaceWithFreshRequest(jobId: String) {
+    private fun replaceWithFreshRequest(jobId: String, bytesSentAtStart: Long, bytesSentNow: Long) {
         try {
             val workManager = WorkManager.getInstance(applicationContext)
-            val input = Data.Builder().putAll(inputData).putBoolean(KEY_RESUME, true).build()
+            val plan = planRequeue(inputData.getInt(KEY_IDLE_WAITS, 0), bytesSentAtStart, bytesSentNow)
+            val input = Data.Builder()
+                .putAll(inputData)
+                .putBoolean(KEY_RESUME, true)
+                .putInt(KEY_IDLE_WAITS, plan.idleWaits)
+                .build()
             workManager.enqueueUniqueWork(
                 jobId,
                 ExistingWorkPolicy.REPLACE,
-                buildUploadWorkRequest(jobId, input, REQUEUE_DELAY_SECONDS)
+                buildUploadWorkRequest(jobId, input, plan.delaySeconds)
             )
             val current = store.get(jobId)
             if (current == null || current.cancelRequested) workManager.cancelUniqueWork(jobId)
