@@ -39,10 +39,11 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
 
     /// Creates the background session and sweeps zombie jobs (queued/uploading records
     /// whose background task did not survive a force-quit) on the first plugin call, so an
-    /// app that installs the plugin and never calls it does nothing at launch. The sweep
-    /// enters its latch synchronously inside this call, before the calling method touches
-    /// the store, so a fresh enqueue cannot be mistaken for a zombie. The lock makes the
-    /// once-only guard safe when two calls arrive on different threads.
+    /// app that installs the plugin and never calls it does nothing at launch. The first
+    /// call returns only after the sweep has finished, or after the wait's 3 second bound,
+    /// so no method can save a fresh job that the sweep then mistakes for a zombie or
+    /// overwrite a record the sweep is rewriting. The lock makes the once-only guard safe
+    /// when two calls arrive on different threads: the second call waits for the first.
     private func ensureActivated() {
         activationLock.lock()
         defer { activationLock.unlock() }
@@ -50,6 +51,7 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
         activated = true
         manager.activateSession()
         manager.sweepZombieJobs()
+        manager.waitForZombieSweep()
     }
 
     @objc func enqueueUpload(_ call: CAPPluginCall) {
