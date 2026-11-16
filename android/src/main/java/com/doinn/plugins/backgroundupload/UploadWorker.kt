@@ -11,12 +11,16 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
+import androidx.work.Data
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
+import androidx.work.ExistingWorkPolicy
+import androidx.work.WorkManager
 import androidx.work.workDataOf
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -35,19 +39,47 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         const val KEY_FILE_PATH = "filePath"
         const val KEY_URL = "url"
         const val KEY_HEADERS = "headers"
+        const val KEY_RESUME = "resume"
         const val KEY_NOTIFICATION_TITLE = "notificationTitle"
         const val KEY_PROGRESS_BYTES_SENT = "bytesSent"
         const val KEY_PROGRESS_TOTAL = "totalBytes"
         const val CHANNEL_ID = "doinn_background_upload"
         const val NOTIFICATION_ID_BASE = 42918
+        private const val REQUEUE_DELAY_SECONDS = 5L
         private const val TAG = "UploadWorker"
     }
 
     private val store = UploadJobStore(appContext)
     private val recordRemoved = AtomicBoolean(false)
 
+    /**
+     * Any unexpected exception ends the job as failed rather than escaping: with no load-time
+     * sweep, a record left at `queued` or `uploading` would have nothing behind it.
+     *
+     * A stop that arrives during `setForeground` surfaces as a CancellationException. It is
+     * swallowed on purpose so the flow still reaches the transfer and its final write, which turns
+     * the stop into a `queued` record. The transfer runs under `NonCancellable` so that block still
+     * starts when the stop arrived before `withContext` was entered; it polls `isStopped` itself.
+     */
     override suspend fun doWork(): Result {
         val jobId = inputData.getString(KEY_JOB_ID) ?: return Result.failure()
+        return try {
+            runJob(jobId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Unexpected failure: ${e.javaClass.simpleName}")
+            runCatching {
+                store.update(jobId) {
+                    it.state = "failed"
+                    it.error = e.javaClass.simpleName
+                }
+            }
+            Result.failure()
+        }
+    }
+
+    private suspend fun runJob(jobId: String): Result {
         val title = inputData.getString(KEY_NOTIFICATION_TITLE) ?: "Doinn"
 
         val job = store.update(jobId) { if (!it.cancelRequested) it.state = "uploading" }
@@ -57,12 +89,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         val notificationId = NOTIFICATION_ID_BASE + (jobId.hashCode() and 0x7fffffff) % 10000
         try {
             setForeground(createForegroundInfo(title, notificationId))
+        } catch (e: CancellationException) {
+            Log.i(TAG, "Stopped while starting the foreground service")
         } catch (e: Exception) {
             Log.w(TAG, "Running without a foreground service: ${e.javaClass.simpleName}")
         }
 
-        // The final write must survive a stop: a cancelled coroutine would discard the result of
-        // withContext and leave the record at "uploading". The transfer polls isStopped itself.
         return withContext(Dispatchers.IO + NonCancellable) { transfer(job) }
     }
 
@@ -98,7 +130,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             url = url,
             headers = headers,
             totalBytes = length,
-            resume = job.bytesSent > 0 || runAttemptCount > 0,
+            resume = job.bytesSent > 0 || runAttemptCount > 0 || inputData.getBoolean(KEY_RESUME, false),
             openStream = { openStream(filePath) }
         )
     }
@@ -139,15 +171,24 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
     /**
      * The decision is taken inside the store update, from the freshest record, so a cancel
      * request or an attempt count written meanwhile is honoured.
+     *
+     * A wait that spent no attempt (network lost, or a stop by the system) replaces this work with
+     * a fresh request instead of returning `retry` alone. WorkManager's backoff grows with the run
+     * count of the same work, and every re-run raises it, so only a request with a run count of 0
+     * keeps a job that merely waited for the network from being delayed. A counted retry keeps
+     * `Result.retry()` so that its backoff applies.
      */
     private fun settle(jobId: String, choose: (UploadJob) -> UploadDecision): Result {
         if (recordRemoved.get()) return Result.failure()
+        var attemptsBefore = 0
         val settled = store.update(jobId) { job ->
+            attemptsBefore = job.attempts
             when (val decision = choose(job)) {
                 is UploadDecision.Uploaded -> {
                     job.state = "uploaded"
                     job.httpStatus = decision.httpStatus
                     job.bytesSent = job.totalBytes
+                    job.error = null
                 }
                 is UploadDecision.Failed -> {
                     job.state = "failed"
@@ -169,7 +210,32 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         return when (settled.state) {
             "uploaded" -> Result.success(output)
             "failed" -> Result.failure(output)
-            else -> Result.retry()
+            else -> {
+                if (settled.attempts == attemptsBefore) replaceWithFreshRequest(jobId)
+                Result.retry()
+            }
+        }
+    }
+
+    /**
+     * Enqueues the replacement, then re-reads the record: a cancel or a clear that landed around
+     * the enqueue must not be undone by it. The plugin records a cancel before it cancels the
+     * work, so either that cancel sees this request or this check sees the cancel. A failure here
+     * leaves `Result.retry()` as the fallback.
+     */
+    private fun replaceWithFreshRequest(jobId: String) {
+        try {
+            val workManager = WorkManager.getInstance(applicationContext)
+            val input = Data.Builder().putAll(inputData).putBoolean(KEY_RESUME, true).build()
+            workManager.enqueueUniqueWork(
+                jobId,
+                ExistingWorkPolicy.REPLACE,
+                buildUploadWorkRequest(jobId, input, REQUEUE_DELAY_SECONDS)
+            )
+            val current = store.get(jobId)
+            if (current == null || current.cancelRequested) workManager.cancelUniqueWork(jobId)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not replace the work request: ${e.javaClass.simpleName}")
         }
     }
 

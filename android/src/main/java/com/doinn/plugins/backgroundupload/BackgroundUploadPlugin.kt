@@ -2,11 +2,7 @@ package com.doinn.plugins.backgroundupload
 
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.Observer
-import androidx.work.BackoffPolicy
-import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
-import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.workDataOf
@@ -18,7 +14,6 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.File
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 
 @CapacitorPlugin(name = "BackgroundUpload")
 class BackgroundUploadPlugin : Plugin() {
@@ -111,22 +106,16 @@ class BackgroundUploadPlugin : Plugin() {
                 )
                 notifiedTerminal.remove(jobId)
 
-                val request = OneTimeWorkRequestBuilder<UploadWorker>()
-                    .setInputData(
-                        workDataOf(
-                            UploadWorker.KEY_JOB_ID to jobId,
-                            UploadWorker.KEY_FILE_PATH to filePath,
-                            UploadWorker.KEY_URL to url,
-                            UploadWorker.KEY_HEADERS to headers.toString(),
-                            UploadWorker.KEY_NOTIFICATION_TITLE to notificationTitle
-                        )
+                val request = buildUploadWorkRequest(
+                    jobId,
+                    workDataOf(
+                        UploadWorker.KEY_JOB_ID to jobId,
+                        UploadWorker.KEY_FILE_PATH to filePath,
+                        UploadWorker.KEY_URL to url,
+                        UploadWorker.KEY_HEADERS to headers.toString(),
+                        UploadWorker.KEY_NOTIFICATION_TITLE to notificationTitle
                     )
-                    .setConstraints(
-                        Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
-                    )
-                    .setBackoffCriteria(BackoffPolicy.LINEAR, 10, TimeUnit.SECONDS)
-                    .addTag(WORK_TAG)
-                    .build()
+                )
 
                 WorkManager.getInstance(context)
                     .enqueueUniqueWork(jobId, ExistingWorkPolicy.KEEP, request)
