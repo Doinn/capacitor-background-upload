@@ -51,7 +51,9 @@ class UploadJobStore(private val prefs: SharedPreferences) {
     )
 
     fun save(job: UploadJob) {
-        prefs.edit().putString(job.jobId, job.toJson().toString()).apply()
+        synchronized(lock) {
+            prefs.edit().putString(job.jobId, job.toJson().toString()).apply()
+        }
     }
 
     fun get(jobId: String): UploadJob? =
@@ -61,23 +63,35 @@ class UploadJobStore(private val prefs: SharedPreferences) {
         prefs.all.values.filterIsInstance<String>().map { UploadJob.fromJson(JSONObject(it)) }
 
     fun remove(jobId: String) {
-        prefs.edit().remove(jobId).apply()
+        synchronized(lock) {
+            prefs.edit().remove(jobId).apply()
+        }
     }
 
     /**
-     * Applies [transform] to the stored record and saves it. Writes nothing and returns null when
-     * the record is absent, so a worker still running after [clear] cannot bring its record back.
+     * Applies [transform] to the stored record and saves it, atomically with respect to [save],
+     * [remove], [clear] and other updates on any store instance in this process. Writes nothing and
+     * returns null when the record is absent, so an update that starts after [clear] or [remove]
+     * cannot bring the record back. The transform runs under the lock and must stay short.
      */
-    fun update(jobId: String, transform: (UploadJob) -> Unit): UploadJob? {
-        val job = get(jobId) ?: return null
-        transform(job)
-        save(job)
-        return job
-    }
+    fun update(jobId: String, transform: (UploadJob) -> Unit): UploadJob? =
+        synchronized(lock) {
+            val job = get(jobId) ?: return null
+            transform(job)
+            save(job)
+            job
+        }
 
-    fun clear(): List<UploadJob> {
-        val removed = getAll()
-        prefs.edit().clear().apply()
-        return removed
+    /** Removes every record and returns the records that were present at that moment. */
+    fun clear(): List<UploadJob> =
+        synchronized(lock) {
+            val removed = getAll()
+            prefs.edit().clear().apply()
+            removed
+        }
+
+    private companion object {
+        // The plugin and each worker build their own store, so the lock must be shared across instances.
+        val lock = Any()
     }
 }

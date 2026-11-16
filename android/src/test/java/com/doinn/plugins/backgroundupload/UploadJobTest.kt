@@ -7,6 +7,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 class UploadJobTest {
     @Test
@@ -51,10 +54,60 @@ class UploadJobTest {
         assertEquals(setOf("a", "b"), store.clear().map { it.jobId }.toSet())
         assertTrue(store.getAll().isEmpty())
     }
+
+    @Test
+    fun removeDuringUpdateIsNotUndoneByTheUpdate() {
+        val prefs = FakePrefs()
+        val updater = UploadJobStore(prefs)
+        val remover = UploadJobStore(prefs)
+        updater.save(UploadJob("a", "uploading"))
+        val inTransform = CountDownLatch(1)
+        val removal = thread(start = false) { remover.remove("a") }
+
+        val updating = thread {
+            updater.update("a") {
+                inTransform.countDown()
+                removal.start()
+                Thread.sleep(200)
+                it.bytesSent = 5
+            }
+        }
+        assertTrue(inTransform.await(5, TimeUnit.SECONDS))
+        updating.join(5000)
+        removal.join(5000)
+
+        assertNull(updater.get("a"))
+    }
+
+    @Test
+    fun concurrentUpdatesDoNotLoseFields() {
+        val prefs = FakePrefs()
+        val a = UploadJobStore(prefs)
+        val b = UploadJobStore(prefs)
+        a.save(UploadJob("a", "uploading"))
+        val inTransform = CountDownLatch(1)
+        val cancelling = thread(start = false) { b.update("a") { it.cancelRequested = true } }
+
+        val progressing = thread {
+            a.update("a") {
+                inTransform.countDown()
+                cancelling.start()
+                Thread.sleep(200)
+                it.bytesSent = 5
+            }
+        }
+        assertTrue(inTransform.await(5, TimeUnit.SECONDS))
+        progressing.join(5000)
+        cancelling.join(5000)
+
+        val stored = a.get("a")!!
+        assertEquals(5L, stored.bytesSent)
+        assertTrue(stored.cancelRequested)
+    }
 }
 
 private class FakePrefs : SharedPreferences {
-    private val data = mutableMapOf<String, Any?>()
+    private val data = java.util.concurrent.ConcurrentHashMap<String, Any?>()
 
     override fun getAll(): MutableMap<String, *> = data.toMutableMap()
     override fun getString(key: String, defValue: String?): String? = data[key] as? String ?: defValue
