@@ -12,7 +12,7 @@ public final class BackgroundUploadManager: NSObject {
     var onFailed: ((String, Int?, String) -> Void)?
 
     // Zombie-sweep latch: entered synchronously in `sweepZombieJobs()` (called from
-    // plugin `load()`, before the JS bridge can dispatch any new call), left once the
+    // the plugin's `ensureActivated()`, before the calling method touches the store), left once the
     // `session.getAllTasks` callback has finished reconciling the store. `getJobs`
     // waits on this so it never reads a store that the sweep is still rewriting.
     private let zombieSweepGroup = DispatchGroup()

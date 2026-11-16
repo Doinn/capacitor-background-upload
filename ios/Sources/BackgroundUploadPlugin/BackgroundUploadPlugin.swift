@@ -16,14 +16,10 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private let manager = BackgroundUploadManager.shared
 
+    private let activationLock = NSLock()
+    private var activated = false
+
     override public func load() {
-        manager.activateSession()
-        // Sweep for zombie jobs (queued/uploading records whose background task did
-        // not survive a force-quit) before anything else runs. Entering the sweep's
-        // latch happens synchronously inside this call, before the JS bridge can
-        // dispatch enqueueUpload/getJobs, so there is no window for a fresh enqueue
-        // to be mistaken for a zombie.
-        manager.sweepZombieJobs()
         manager.onProgress = { [weak self] jobId, sent, total in
             self?.notifyListeners("uploadProgress", data: [
                 "jobId": jobId, "bytesSent": sent, "totalBytes": total
@@ -41,7 +37,23 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Creates the background session and sweeps zombie jobs (queued/uploading records
+    /// whose background task did not survive a force-quit) on the first plugin call, so an
+    /// app that installs the plugin and never calls it does nothing at launch. The sweep
+    /// enters its latch synchronously inside this call, before the calling method touches
+    /// the store, so a fresh enqueue cannot be mistaken for a zombie. The lock makes the
+    /// once-only guard safe when two calls arrive on different threads.
+    private func ensureActivated() {
+        activationLock.lock()
+        defer { activationLock.unlock() }
+        if activated { return }
+        activated = true
+        manager.activateSession()
+        manager.sweepZombieJobs()
+    }
+
     @objc func enqueueUpload(_ call: CAPPluginCall) {
+        ensureActivated()
         guard let jobId = call.getString("jobId"),
               let filePath = call.getString("filePath"),
               let url = call.getString("url") else {
@@ -65,6 +77,7 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func prepareFile(_ call: CAPPluginCall) {
+        ensureActivated()
         guard let filePath = call.getString("filePath") else {
             call.reject("filePath is required")
             return
@@ -91,6 +104,7 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func getJobs(_ call: CAPPluginCall) {
+        ensureActivated()
         // Must not race the startup zombie sweep (see manager.sweepZombieJobs()).
         manager.waitForZombieSweep()
         let jobs = manager.store.getAll().map { job -> [String: Any] in
@@ -108,6 +122,7 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func acknowledge(_ call: CAPPluginCall) {
+        ensureActivated()
         guard let jobId = call.getString("jobId") else {
             call.reject("jobId is required")
             return
@@ -121,6 +136,7 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func cancel(_ call: CAPPluginCall) {
+        ensureActivated()
         guard let jobId = call.getString("jobId") else {
             call.reject("jobId is required")
             return
@@ -130,6 +146,7 @@ public class BackgroundUploadPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func cleanupOrphans(_ call: CAPPluginCall) {
+        ensureActivated()
         let maxAgeMs = call.getInt("maxAgeMs") ?? UploadFilePreparer.defaultOrphanMaxAgeMs
         let referencedPaths = Set(manager.store.getAll().compactMap { $0.filePath })
 
