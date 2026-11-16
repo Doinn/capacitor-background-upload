@@ -33,4 +33,37 @@ class UploadFilePreparerTest {
         assertFalse(UploadFilePreparer.isInside(dir, dir.path + "/../x"))
         assertFalse(UploadFilePreparer.isInside(dir, dir.path + "-other/a"))
     }
+
+    @Test
+    fun keepsJpegSourceWhenOutputIsLarger() {
+        assertTrue(UploadFilePreparer.shouldKeepSource("image/jpeg", 1_000L, 1_001L))
+    }
+
+    @Test
+    fun keepsJpegSourceWhenOutputIsEqual() {
+        assertTrue(UploadFilePreparer.shouldKeepSource("image/jpeg", 1_000L, 1_000L))
+    }
+
+    @Test
+    fun keepsOutputWhenItIsSmallerThanJpegSource() {
+        assertFalse(UploadFilePreparer.shouldKeepSource("image/jpeg", 1_000L, 999L))
+    }
+
+    @Test
+    fun keepsOutputForNonJpegSources() {
+        listOf("image/heic", "image/png", "image/webp", null).forEach {
+            assertFalse("for $it", UploadFilePreparer.shouldKeepSource(it, 10L, 1_000L))
+        }
+    }
+
+    @Test
+    fun keepsOutputWhenSourceSizeIsUnknown() {
+        assertFalse(UploadFilePreparer.shouldKeepSource("image/jpeg", null, 1_000L))
+    }
+
+    @Test
+    fun readsJpegMimeTypeInAnyCaseAndWithParameters() {
+        assertTrue(UploadFilePreparer.shouldKeepSource("IMAGE/JPEG", 1_000L, 2_000L))
+        assertTrue(UploadFilePreparer.shouldKeepSource("image/jpeg; charset=binary", 1_000L, 2_000L))
+    }
 }

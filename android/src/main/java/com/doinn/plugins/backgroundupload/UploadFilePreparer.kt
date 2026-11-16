@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Log
 import android.webkit.MimeTypeMap
 import androidx.exifinterface.media.ExifInterface
 import java.io.File
@@ -20,6 +22,7 @@ data class PreparedFile(val path: String, val size: Long, val mimeType: String?)
  * run with a plain file path, not a transient content:// read grant).
  */
 object UploadFilePreparer {
+    private const val TAG = "UploadFilePreparer"
     private const val CACHE_SUBDIR = "doinn-bg-upload"
     private const val DEFAULT_JPEG_QUALITY = 0.8
     const val DEFAULT_ORPHAN_MAX_AGE_MS = 86_400_000L
@@ -86,6 +89,7 @@ object UploadFilePreparer {
                 context,
                 filePath,
                 isContentUri,
+                sourceMimeType,
                 imageMaxDimension,
                 imageQuality ?: DEFAULT_JPEG_QUALITY
             )
@@ -105,6 +109,18 @@ object UploadFilePreparer {
             return PreparedFile(original.absolutePath, original.length(), sourceMimeType)
         }
         return copyFileToCache(context, original, sourceMimeType, deleteSource)
+    }
+
+    /**
+     * True when re-encoding gained nothing: a JPEG source whose downscaled output is not
+     * smaller. Keeping the source avoids a second lossy pass and keeps all its metadata.
+     * Other source types stay converted (the format change is wanted), and an unknown
+     * source size keeps the output.
+     */
+    fun shouldKeepSource(sourceMimeType: String?, sourceBytes: Long?, outputBytes: Long): Boolean {
+        val type = sourceMimeType?.substringBefore(';')?.trim()?.lowercase()
+        if (type != "image/jpeg" || sourceBytes == null) return false
+        return outputBytes >= sourceBytes
     }
 
     private fun resolveMimeType(context: Context, filePath: String, isContentUri: Boolean): String? {
@@ -127,13 +143,15 @@ object UploadFilePreparer {
     }
 
     /**
-     * Returns null (never throws) when the source can't be decoded as an image, so callers
-     * can fall back to the copy/original path instead of crashing on a mislabeled "image".
+     * Returns null (never throws) when the source can't be decoded as an image, or when
+     * [shouldKeepSource] says re-encoding gained nothing, so callers fall back to the
+     * copy/original path instead of crashing on a mislabeled "image".
      */
     private fun tryDownscaleImage(
         context: Context,
         filePath: String,
         isContentUri: Boolean,
+        sourceMimeType: String?,
         maxDimension: Int,
         quality: Double
     ): PreparedFile? {
@@ -158,14 +176,71 @@ object UploadFilePreparer {
                 val quality100 = Math.round(quality * 100).toInt().coerceIn(1, 100)
                 scaledBitmap.compress(Bitmap.CompressFormat.JPEG, quality100, out)
             }
+            val outputWidth = scaledBitmap.width
+            val outputHeight = scaledBitmap.height
             if (scaledBitmap !== rotatedBitmap) scaledBitmap.recycle()
             if (rotatedBitmap !== sampledBitmap) rotatedBitmap.recycle()
             sampledBitmap.recycle()
+
+            copyExif(context, filePath, isContentUri, outputFile, outputWidth, outputHeight)
+
+            val sourceBytes = sourceLength(context, filePath, isContentUri)
+            if (shouldKeepSource(sourceMimeType, sourceBytes, outputFile.length())) {
+                outputFile.delete()
+                return null
+            }
 
             PreparedFile(outputFile.absolutePath, outputFile.length(), "image/jpeg")
         } catch (e: Exception) {
             null
         } catch (e: OutOfMemoryError) {
+            null
+        }
+    }
+
+    /**
+     * The upload URL is signed for the final file size, so callers must read the length
+     * after this runs. A failure here is logged and swallowed: a photo without metadata
+     * is better than no photo, and the downscaled file is left untouched.
+     */
+    private fun copyExif(
+        context: Context,
+        filePath: String,
+        isContentUri: Boolean,
+        output: File,
+        width: Int,
+        height: Int
+    ) {
+        try {
+            val source = openStream(context, filePath, isContentUri).use { ExifInterface(it) }
+            val target = ExifInterface(output.absolutePath)
+            ExifTags.PRESERVED.forEach { tag ->
+                source.getAttribute(tag)?.let { target.setAttribute(tag, it) }
+            }
+            target.setAttribute(ExifInterface.TAG_ORIENTATION, ExifTags.ORIENTATION_AFTER_ROTATION.toString())
+            target.setAttribute(ExifInterface.TAG_IMAGE_WIDTH, width.toString())
+            target.setAttribute(ExifInterface.TAG_IMAGE_LENGTH, height.toString())
+            target.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, width.toString())
+            target.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, height.toString())
+            target.saveAttributes()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not copy EXIF metadata: ${e.javaClass.simpleName}")
+        }
+    }
+
+    /** Source length without reading the content; null when the provider does not report it. */
+    private fun sourceLength(context: Context, filePath: String, isContentUri: Boolean): Long? {
+        return try {
+            if (!isContentUri) {
+                return File(Uri.parse(filePath).path ?: filePath).length().takeIf { it > 0 }
+            }
+            val uri = Uri.parse(filePath)
+            val fromDescriptor = context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+            if (fromDescriptor != null && fromDescriptor >= 0) return fromDescriptor
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0).takeIf { it >= 0 } else null
+            }
+        } catch (e: Exception) {
             null
         }
     }
