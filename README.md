@@ -33,6 +33,12 @@ const { path, size, mimeType } = await BackgroundUpload.prepareFile({
 })
 ```
 
+`mimeType` is omitted when it cannot be determined.
+
+### `discardPreparedFile({ path })` (Android only)
+
+Deletes a file returned by `prepareFile` that was never enqueued. A path outside the plugin's cache dir is ignored. Resolves with no value.
+
 ### `enqueueUpload(options)`
 
 Queues a background upload. Resolves when the job is enqueued, not when it finishes — listen to events for completion.
@@ -49,19 +55,54 @@ await BackgroundUpload.enqueueUpload({
 
 ### `getJobs()`
 
-Returns all persisted jobs: `{ jobs: [{ jobId, state, bytesSent, totalBytes, httpStatus?, error? }] }`. `state` is `queued | uploading | uploaded | failed`. Used for boot reconciliation after app restart.
+Returns all persisted jobs. This is the reliable way to learn the state of a job; use it for boot reconciliation after an app restart.
+
+```js
+const { jobs } = await BackgroundUpload.getJobs()
+// jobs: [{ jobId, state, bytesSent, totalBytes, httpStatus?, error?, attempts, createdAt }]
+```
+
+- `attempts` (Android only): number of counted attempts so far.
+- `createdAt` (Android only): time the job was enqueued, in milliseconds since the epoch.
 
 ### `acknowledge({ jobId })`
 
-Removes a terminal job from the store and deletes its prepared file from the cache dir. Call after the app has confirmed the upload with the backend.
+Cancels any pending work for the job, removes its record from the store and deletes its prepared file from the cache dir. Call it after the app has confirmed the upload with the backend, or to drop a job that is no longer wanted.
 
 ### `cancel({ jobId })`
 
-Cancels the work and marks the job `failed` with error `cancelled`.
+Marks the job `failed` with the error `cancelled` and cancels its work. A job that is already `uploaded` keeps that state. This is the only way a job ends as `failed` with the error `cancelled`.
 
 ### `cleanupOrphans({ maxAgeMs? })`
 
 Deletes prepared files in the cache dir no longer referenced by any job and older than `maxAgeMs` (default 24h). Returns `{ deleted }`.
+
+### `clearAll()` (Android only)
+
+Meant to be called once per JavaScript start, before any upload. It removes every job record, cancels all pending work and deletes every file in the plugin's cache dir. Resolves with:
+
+```js
+{ cancelled, deletedFiles, oldestAgeMs }
+```
+
+`cancelled` is the number of job records removed, `deletedFiles` the number of files deleted, and `oldestAgeMs` the age of the oldest removed job, or `null` when there was none.
+
+### Job states
+
+| State | Meaning |
+| --- | --- |
+| `queued` | Not transferring. This covers a job that has not started, one waiting for the network, and one waiting between attempts. |
+| `uploading` | A transfer is running. |
+| `uploaded` | The server answered with a 2xx status. |
+| `failed` | The job ended with an error, see `error` and `httpStatus`. |
+
+### Retries (Android)
+
+- A transfer is attempted at most 5 times for retryable failures: HTTP 408, 429, any 5xx, 308 on the data request, and network errors while a network is available. Each of these consumes an attempt, and the job fails after the fifth.
+- Any other 4xx fails the job at once.
+- A loss of connectivity does not consume an attempt. The job returns to `queued` and runs again once a network is available.
+- A stop by the system does not consume an attempt either. The job returns to `queued`.
+- A job that returns to `queued` without consuming an attempt is re-run about 5 seconds after it is rescheduled, once the network constraint is met. For GCS resumable sessions the transfer continues from the committed offset.
 
 ### Events
 
@@ -71,7 +112,15 @@ BackgroundUpload.addListener('uploadCompleted', ({ jobId, httpStatus }) => {})
 BackgroundUpload.addListener('uploadFailed', ({ jobId, httpStatus, error }) => {})
 ```
 
-Terminal events are also replayed on app start for jobs that finished while the app was dead — reconcile with `getJobs()` on boot.
+Events are best effort. They can be missed while the app is not running, and a terminal event can arrive again after an app restart. Always reconcile with `getJobs()` on boot instead of relying on events. A `cancel` may or may not emit `uploadFailed`, depending on timing.
+
+## Known limits
+
+- A switch from Wi-Fi to mobile data breaks the connection while a network is still reported. That failure consumes an attempt.
+- On Android 12 and later, a job that starts or re-runs while the app is in the background may run without a foreground service, and the system may delay it.
+- Android limits the `dataSync` foreground service type to 6 hours in any 24.
+- The Doinn app does not route iOS uploads through this plugin in this version. On iOS the plugin creates no background session and does no work until the first call to one of its methods.
+- `getJobs` returns only `jobId`, `state`, `bytesSent`, `totalBytes`, `httpStatus` and `error` on iOS, and the retry rules above describe Android only.
 
 ## Release
 
