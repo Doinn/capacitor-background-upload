@@ -4,8 +4,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
@@ -13,17 +16,17 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import java.io.File
 import java.io.InputStream
-import java.io.InterruptedIOException
-import okhttp3.MediaType
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import okio.BufferedSink
-import okio.source
 import org.json.JSONObject
 
+/**
+ * Hosts one [UploadTransfer] inside WorkManager and records what [decide] says about its outcome.
+ * It owns no retry policy: the attempt count lives in the job record and the rules in [decide].
+ */
 class UploadWorker(appContext: Context, params: WorkerParameters) :
     CoroutineWorker(appContext, params) {
 
@@ -37,123 +40,146 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         const val KEY_PROGRESS_TOTAL = "totalBytes"
         const val CHANNEL_ID = "doinn_background_upload"
         const val NOTIFICATION_ID_BASE = 42918
-        const val MAX_ATTEMPTS = 5
+        private const val TAG = "UploadWorker"
     }
 
     private val store = UploadJobStore(appContext)
+    private val recordRemoved = AtomicBoolean(false)
 
     override suspend fun doWork(): Result {
         val jobId = inputData.getString(KEY_JOB_ID) ?: return Result.failure()
-        if (isStopped) return markCancelled(jobId)
-        val filePath = inputData.getString(KEY_FILE_PATH) ?: return failJob(jobId, "missing filePath")
-        val url = inputData.getString(KEY_URL) ?: return failJob(jobId, "missing url")
-        val headersJson = inputData.getString(KEY_HEADERS) ?: "{}"
         val title = inputData.getString(KEY_NOTIFICATION_TITLE) ?: "Doinn"
 
-        val notificationId = NOTIFICATION_ID_BASE + (jobId.hashCode() and 0x7fffffff) % 10000
+        val job = store.update(jobId) { if (!it.cancelRequested) it.state = "uploading" }
+            ?: return Result.failure()
+        if (job.cancelRequested) return Result.failure()
 
+        val notificationId = NOTIFICATION_ID_BASE + (jobId.hashCode() and 0x7fffffff) % 10000
         try {
             setForeground(createForegroundInfo(title, notificationId))
         } catch (e: Exception) {
-            // FGS pode ser recusado (quota Android 14+); upload segue como worker normal
+            Log.w(TAG, "Running without a foreground service: ${e.javaClass.simpleName}")
         }
 
-        val job = store.get(jobId) ?: UploadJob(jobId, "queued")
-        if (isStopped) return markCancelled(jobId)
-        job.state = "uploading"
-        store.save(job)
+        // The final write must survive a stop: a cancelled coroutine would discard the result of
+        // withContext and leave the record at "uploading". The transfer polls isStopped itself.
+        return withContext(Dispatchers.IO + NonCancellable) { transfer(job) }
+    }
 
-        return try {
-            val (length, contentType) = resolveFileMeta(filePath)
-            if (isStopped) return markCancelled(jobId)
-            job.totalBytes = length
-            store.save(job)
+    private fun transfer(job: UploadJob): Result {
+        val jobId = job.jobId
+        val request = try {
+            buildRequest(job)
+        } catch (e: Exception) {
+            val error = e.message ?: e.javaClass.simpleName
+            return settle(jobId) { UploadDecision.Failed(null, error, it.attempts) }
+        }
+        if (!record(jobId) { it.totalBytes = request.totalBytes }) return Result.failure()
 
-            val client = OkHttpClient.Builder().build()
+        val outcome = UploadTransfer(OkHttpClient.Builder().build(), ::hasNetwork).run(
+            request,
+            isCancelled = { isStopped || recordRemoved.get() },
+            onProgress = { sent -> reportProgress(jobId, sent, request.totalBytes) }
+        )
+        return settle(jobId) { decide(it.attempts, outcome, it.cancelRequested) }
+    }
 
-            val startOffset = if (runAttemptCount > 0) {
-                probeCommittedOffset(client, url, length)
-            } else 0L
+    private fun buildRequest(job: UploadJob): TransferRequest {
+        val filePath = inputData.getString(KEY_FILE_PATH) ?: throw IllegalStateException("missing filePath")
+        val url = inputData.getString(KEY_URL) ?: throw IllegalStateException("missing url")
+        val headersJson = JSONObject(inputData.getString(KEY_HEADERS) ?: "{}")
+        val (length, contentType) = resolveFileMeta(filePath)
+        val headers = mutableMapOf<String, String>()
+        headersJson.keys().forEach { key -> headers[key] = headersJson.getString(key) }
+        if (headers.keys.none { it.equals("Content-Type", ignoreCase = true) }) {
+            headers["Content-Type"] = contentType ?: "application/octet-stream"
+        }
+        return TransferRequest(
+            url = url,
+            headers = headers,
+            totalBytes = length,
+            resume = job.bytesSent > 0 || runAttemptCount > 0,
+            openStream = { openStream(filePath) }
+        )
+    }
 
-            if (startOffset >= length) {
-                job.state = "uploaded"
-                job.bytesSent = length
-                store.save(job)
-                return Result.success(workDataOf(KEY_JOB_ID to jobId))
-            }
-
-            val body = streamingBody(filePath, startOffset, length, contentType) { sent ->
-                job.bytesSent = sent
-                store.save(job)
-                setProgressAsync(
-                    workDataOf(
-                        KEY_JOB_ID to jobId,
-                        KEY_PROGRESS_BYTES_SENT to sent,
-                        KEY_PROGRESS_TOTAL to length
-                    )
+    /**
+     * The transfer calls this from inside the request body and turns any exception into a
+     * terminal failure, so a store or WorkManager error must not escape and end an upload that
+     * could still succeed.
+     */
+    private fun reportProgress(jobId: String, sent: Long, total: Long) {
+        try {
+            if (!record(jobId) { it.bytesSent = sent }) return
+            setProgressAsync(
+                workDataOf(
+                    KEY_JOB_ID to jobId,
+                    KEY_PROGRESS_BYTES_SENT to sent,
+                    KEY_PROGRESS_TOTAL to total
                 )
-            }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Progress report failed: ${e.javaClass.simpleName}")
+        }
+    }
 
-            val requestBuilder = Request.Builder().url(url).put(body)
-            if (startOffset > 0) {
-                requestBuilder.header("Content-Range", "bytes $startOffset-${length - 1}/$length")
-            }
-            val headers = JSONObject(headersJson)
-            headers.keys().forEach { key ->
-                requestBuilder.header(key, headers.getString(key))
-            }
+    /**
+     * Applies a store update and remembers when the record is gone, so the transfer stops at its
+     * next chunk and nothing writes the record back. Returns false once the record is gone.
+     */
+    private fun record(jobId: String, transform: (UploadJob) -> Unit): Boolean {
+        if (recordRemoved.get()) return false
+        if (store.update(jobId, transform) == null) {
+            recordRemoved.set(true)
+            return false
+        }
+        return true
+    }
 
-            val response = client.newCall(requestBuilder.build()).execute()
-            response.use {
-                if (it.isSuccessful) {
-                    if (isStopped) {
-                        return markCancelled(jobId)
-                    }
+    /**
+     * The decision is taken inside the store update, from the freshest record, so a cancel
+     * request or an attempt count written meanwhile is honoured.
+     */
+    private fun settle(jobId: String, choose: (UploadJob) -> UploadDecision): Result {
+        if (recordRemoved.get()) return Result.failure()
+        val settled = store.update(jobId) { job ->
+            when (val decision = choose(job)) {
+                is UploadDecision.Uploaded -> {
                     job.state = "uploaded"
-                    job.httpStatus = it.code
-                    job.bytesSent = length
-                    store.save(job)
-                    Result.success(workDataOf(KEY_JOB_ID to jobId))
-                } else {
-                    if (isStopped) {
-                        return markCancelled(jobId)
-                    }
-                    if ((it.code in 500..599 || it.code == 308) && runAttemptCount < MAX_ATTEMPTS) {
-                        Result.retry()
-                    } else {
-                        job.state = "failed"
-                        job.httpStatus = it.code
-                        job.error = "HTTP ${it.code}"
-                        store.save(job)
-                        Result.failure(workDataOf(KEY_JOB_ID to jobId))
-                    }
+                    job.httpStatus = decision.httpStatus
+                    job.bytesSent = job.totalBytes
+                }
+                is UploadDecision.Failed -> {
+                    job.state = "failed"
+                    job.httpStatus = decision.httpStatus
+                    job.error = decision.error
+                    job.attempts = decision.attempts
+                }
+                is UploadDecision.RetryLater -> {
+                    job.state = "queued"
+                    job.attempts = decision.attempts
                 }
             }
-        } catch (e: Exception) {
-            if (isStopped) {
-                markCancelled(jobId)
-            } else if (runAttemptCount < MAX_ATTEMPTS) {
-                Result.retry()
-            } else {
-                failJob(jobId, e.message ?: e.javaClass.simpleName)
-            }
+        }
+        if (settled == null) {
+            recordRemoved.set(true)
+            return Result.failure()
+        }
+        val output = workDataOf(KEY_JOB_ID to jobId)
+        return when (settled.state) {
+            "uploaded" -> Result.success(output)
+            "failed" -> Result.failure(output)
+            else -> Result.retry()
         }
     }
 
-    private fun failJob(jobId: String, message: String): Result {
-        val job = store.get(jobId) ?: UploadJob(jobId, "failed")
-        job.state = "failed"
-        job.error = message
-        store.save(job)
-        return Result.failure(workDataOf(KEY_JOB_ID to jobId))
-    }
-
-    private fun markCancelled(jobId: String): Result {
-        val job = store.get(jobId) ?: UploadJob(jobId, "failed")
-        job.state = "failed"
-        job.error = "cancelled"
-        store.save(job)
-        return Result.failure(workDataOf(KEY_JOB_ID to jobId))
+    /** A failed read of connectivity counts as online, so the failure becomes a counted retry. */
+    private fun hasNetwork(): Boolean = try {
+        val manager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        manager.getNetworkCapabilities(manager.activeNetwork)
+            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    } catch (e: Exception) {
+        true
     }
 
     private fun resolveFileMeta(filePath: String): Pair<Long, String?> {
@@ -170,79 +196,12 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         }
     }
 
-    /**
-     * Asks the GCS resumable session how many bytes it already has
-     * (PUT with a wildcard Content-Range header, e.g. "bytes (star)/total", and empty body).
-     * 200/201 -> whole object committed; 308 + Range header -> committed prefix;
-     * anything else (or any error) -> 0 (restart from scratch, fase 1 behavior).
-     */
-    private fun probeCommittedOffset(client: OkHttpClient, url: String, totalBytes: Long): Long {
-        return try {
-            val request = Request.Builder()
-                .url(url)
-                .put(ByteArray(0).toRequestBody(null))
-                .header("Content-Range", "bytes */$totalBytes")
-                .build()
-            client.newCall(request).execute().use { response ->
-                when {
-                    response.code == 200 || response.code == 201 -> totalBytes
-                    response.code == 308 -> {
-                        val range = response.header("Range")
-                        val match = Regex("bytes=0-(\\d+)").find(range ?: "")
-                        match?.groupValues?.get(1)?.toLong()?.plus(1) ?: 0L
-                    }
-                    else -> 0L
-                }
-            }
-        } catch (e: Exception) {
-            0L
-        }
-    }
-
     private fun openStream(filePath: String): InputStream {
         return if (filePath.startsWith("content://")) {
             applicationContext.contentResolver.openInputStream(Uri.parse(filePath))
                 ?: throw IllegalStateException("Cannot open $filePath")
         } else {
             File(Uri.parse(filePath).path ?: filePath).inputStream()
-        }
-    }
-
-    private fun streamingBody(
-        filePath: String,
-        offset: Long,
-        totalLength: Long,
-        contentType: String?,
-        onProgress: (Long) -> Unit
-    ): RequestBody {
-        return object : RequestBody() {
-            override fun contentType(): MediaType? =
-                (contentType ?: "application/octet-stream").toMediaTypeOrNull()
-
-            override fun contentLength(): Long = totalLength - offset
-
-            override fun writeTo(sink: BufferedSink) {
-                openStream(filePath).use { stream ->
-                    var toSkip = offset
-                    while (toSkip > 0) {
-                        val skipped = stream.skip(toSkip)
-                        if (skipped <= 0) throw InterruptedIOException("cannot seek to offset $offset")
-                        toSkip -= skipped
-                    }
-                    stream.source().use { source ->
-                        var total = offset
-                        var read: Long
-                        while (source.read(sink.buffer, 262144).also { read = it } != -1L) {
-                            if (isStopped) {
-                                throw InterruptedIOException("cancelled")
-                            }
-                            total += read
-                            sink.flush()
-                            onProgress(total)
-                        }
-                    }
-                }
-            }
         }
     }
 

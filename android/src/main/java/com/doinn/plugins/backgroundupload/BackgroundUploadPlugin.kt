@@ -19,7 +19,6 @@ import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 @CapacitorPlugin(name = "BackgroundUpload")
 class BackgroundUploadPlugin : Plugin() {
@@ -33,60 +32,10 @@ class BackgroundUploadPlugin : Plugin() {
     private var workLiveData: LiveData<List<WorkInfo>>? = null
     private val notifiedTerminal = mutableSetOf<String>()
     private val prepareExecutor = Executors.newSingleThreadExecutor()
-    private val zombieSweepStarted = AtomicBoolean(false)
 
     override fun load() {
         store = UploadJobStore(context)
-        // One sweep per process launch, scheduled on the plugin's single-thread
-        // executor before load() returns (i.e. before the bridge can dispatch any
-        // enqueueUpload/getJobs call), so a fresh enqueue can never be mistaken for a
-        // zombie. enqueueUpload/getJobs read/write the store through the same executor
-        // below, which guarantees they run after this task without needing a separate
-        // latch. Guarded so a re-entrant load() never schedules a second sweep.
-        if (zombieSweepStarted.compareAndSet(false, true)) {
-            prepareExecutor.execute { sweepZombieJobs() }
-        }
         observeWork()
-    }
-
-    /**
-     * A force-stop (or the process being killed) can leave a WorkManager job dead
-     * without [UploadWorker] ever getting to write a terminal state, so the store
-     * keeps reporting `queued`/`uploading` forever. Reconcile against WorkManager's
-     * own bookkeeping:
-     * - No work info at all, or every work info already CANCELLED/FAILED, means the
-     *   worker never ran to completion and wrote back - mark it failed so the JS
-     *   reconciler can clean it up.
-     * - Every work info SUCCEEDED means the upload actually finished but the store
-     *   flush was lost (process killed after doWork returned) - recover it as
-     *   `uploaded` rather than failing a job that really did complete; the JS
-     *   reconciler will confirm it against the backend.
-     */
-    private fun sweepZombieJobs() {
-        val workManager = WorkManager.getInstance(context)
-        store.getAll()
-            .filter { it.state == "queued" || it.state == "uploading" }
-            .forEach { job ->
-                val infos = try {
-                    workManager.getWorkInfosForUniqueWork(job.jobId).get()
-                } catch (e: Exception) {
-                    // Can't determine WorkManager's state for this job right now -
-                    // skip it for this pass rather than guessing; it will be
-                    // re-evaluated on the next process launch.
-                    return@forEach
-                }
-                when {
-                    infos.isNotEmpty() && infos.all { it.state == WorkInfo.State.SUCCEEDED } -> {
-                        job.state = "uploaded"
-                        store.save(job)
-                    }
-                    infos.isEmpty() || infos.all { it.state.isFinished } -> {
-                        job.state = "failed"
-                        job.error = "orphaned (app terminated)"
-                        store.save(job)
-                    }
-                }
-            }
     }
 
     override fun handleOnDestroy() {
@@ -148,13 +97,18 @@ class BackgroundUploadPlugin : Plugin() {
         val headers = call.getObject("headers") ?: JSObject()
         val notificationTitle = call.getString("notificationTitle") ?: "Doinn"
 
-        // Routed through the same single-thread executor as the startup zombie sweep
-        // (see load()/sweepZombieJobs()) so the store write and WorkManager enqueue are
-        // ordered after it - a fresh enqueue landing right after load() can no longer be
-        // mistaken for a zombie by a still-running sweep.
         prepareExecutor.execute {
             try {
-                store.save(UploadJob(jobId, "queued", filePath = filePath))
+                store.save(
+                    UploadJob(
+                        jobId,
+                        "queued",
+                        filePath = filePath,
+                        createdAt = System.currentTimeMillis(),
+                        attempts = 0,
+                        cancelRequested = false
+                    )
+                )
                 notifiedTerminal.remove(jobId)
 
                 val request = OneTimeWorkRequestBuilder<UploadWorker>()
@@ -170,7 +124,7 @@ class BackgroundUploadPlugin : Plugin() {
                     .setConstraints(
                         Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
                     )
-                    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS)
+                    .setBackoffCriteria(BackoffPolicy.LINEAR, 10, TimeUnit.SECONDS)
                     .addTag(WORK_TAG)
                     .build()
 
@@ -231,9 +185,6 @@ class BackgroundUploadPlugin : Plugin() {
 
     @PluginMethod
     fun getJobs(call: PluginCall) {
-        // Routed through the same single-thread executor as the startup zombie sweep
-        // (see load()/sweepZombieJobs()) so the read is ordered after it - no latch
-        // needed, the executor's FIFO ordering is the synchronization.
         prepareExecutor.execute {
             val jobs = JSArray()
             store.getAll().forEach { job ->
@@ -244,6 +195,8 @@ class BackgroundUploadPlugin : Plugin() {
                 obj.put("totalBytes", job.totalBytes)
                 job.httpStatus?.let { obj.put("httpStatus", it) }
                 job.error?.let { obj.put("error", it) }
+                obj.put("attempts", job.attempts)
+                obj.put("createdAt", job.createdAt)
                 jobs.put(obj)
             }
             val result = JSObject()
@@ -277,13 +230,16 @@ class BackgroundUploadPlugin : Plugin() {
             call.reject("jobId is required")
             return
         }
-        WorkManager.getInstance(context).cancelUniqueWork(jobId)
-        val job = store.get(jobId)
-        if (job != null && job.state != "uploaded") {
-            job.state = "failed"
-            job.error = "cancelled"
-            store.save(job)
+        // The request is recorded first so a worker that ends as a retry while it is being
+        // stopped reads it and settles as cancelled instead of going back to the queue.
+        store.update(jobId) { job ->
+            job.cancelRequested = true
+            if (job.state != "uploaded") {
+                job.state = "failed"
+                job.error = "cancelled"
+            }
         }
+        WorkManager.getInstance(context).cancelUniqueWork(jobId)
         call.resolve()
     }
 }
