@@ -11,10 +11,12 @@ sealed class UploadDecision {
 /**
  * Only a retryable server or transport failure spends an attempt. A lost network waits without
  * counting, and a system stop returns the job to the queue, because neither says the file is bad.
- * Only a cancel requested through the plugin ends the job.
+ * Only a cancel requested through the plugin ends the job: it can race a transfer that ends as a
+ * retry just before the worker is stopped, so any wait-and-retry answer becomes a cancellation
+ * then. A success or a failure with its own cause is reported as it is.
  */
-fun decide(attempts: Int, outcome: TransferOutcome, cancelRequested: Boolean): UploadDecision =
-    when (outcome) {
+fun decide(attempts: Int, outcome: TransferOutcome, cancelRequested: Boolean): UploadDecision {
+    val decision = when (outcome) {
         is TransferOutcome.Success -> UploadDecision.Uploaded(outcome.httpStatus)
         is TransferOutcome.Fail -> UploadDecision.Failed(outcome.httpStatus, outcome.error, attempts)
         is TransferOutcome.Retry -> {
@@ -23,7 +25,11 @@ fun decide(attempts: Int, outcome: TransferOutcome, cancelRequested: Boolean): U
             else UploadDecision.RetryLater(next)
         }
         is TransferOutcome.NetworkLost -> UploadDecision.RetryLater(attempts)
-        TransferOutcome.Cancelled ->
-            if (cancelRequested) UploadDecision.Failed(null, "cancelled", attempts)
-            else UploadDecision.RetryLater(attempts)
+        TransferOutcome.Cancelled -> UploadDecision.RetryLater(attempts)
     }
+    return if (cancelRequested && decision is UploadDecision.RetryLater) {
+        UploadDecision.Failed(null, "cancelled", attempts)
+    } else {
+        decision
+    }
+}
