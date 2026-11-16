@@ -1,0 +1,87 @@
+package com.doinn.plugins.backgroundupload
+
+import android.content.SharedPreferences
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class UploadJobTest {
+    @Test
+    fun roundTripKeepsNewFields() {
+        val job = UploadJob("a", "queued", attempts = 3, createdAt = 1700000000000, cancelRequested = true)
+        val parsed = UploadJob.fromJson(job.toJson())
+        assertEquals(3, parsed.attempts)
+        assertEquals(1700000000000, parsed.createdAt)
+        assertTrue(parsed.cancelRequested)
+    }
+
+    @Test
+    fun recordFromV100ParsesWithDefaults() {
+        val parsed = UploadJob.fromJson(
+            JSONObject("""{"jobId":"a","state":"uploading","bytesSent":10,"totalBytes":20}""")
+        )
+        assertEquals(0, parsed.attempts)
+        assertEquals(0L, parsed.createdAt)
+        assertFalse(parsed.cancelRequested)
+    }
+
+    @Test
+    fun updateOnMissingRecordWritesNothing() {
+        val store = UploadJobStore(FakePrefs())
+        assertNull(store.update("gone") { it.bytesSent = 5 })
+        assertTrue(store.getAll().isEmpty())
+    }
+
+    @Test
+    fun updateOnExistingRecordPersists() {
+        val store = UploadJobStore(FakePrefs())
+        store.save(UploadJob("a", "queued"))
+        store.update("a") { it.bytesSent = 5 }
+        assertEquals(5L, store.get("a")!!.bytesSent)
+    }
+
+    @Test
+    fun clearReturnsAndRemovesEverything() {
+        val store = UploadJobStore(FakePrefs())
+        store.save(UploadJob("a", "queued"))
+        store.save(UploadJob("b", "uploading"))
+        assertEquals(setOf("a", "b"), store.clear().map { it.jobId }.toSet())
+        assertTrue(store.getAll().isEmpty())
+    }
+}
+
+private class FakePrefs : SharedPreferences {
+    private val data = mutableMapOf<String, Any?>()
+
+    override fun getAll(): MutableMap<String, *> = data.toMutableMap()
+    override fun getString(key: String, defValue: String?): String? = data[key] as? String ?: defValue
+    override fun contains(key: String): Boolean = data.containsKey(key)
+    override fun edit(): SharedPreferences.Editor = FakeEditor()
+
+    override fun getStringSet(key: String, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+    override fun getInt(key: String, defValue: Int): Int = defValue
+    override fun getLong(key: String, defValue: Long): Long = defValue
+    override fun getFloat(key: String, defValue: Float): Float = defValue
+    override fun getBoolean(key: String, defValue: Boolean): Boolean = defValue
+    override fun registerOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) = Unit
+    override fun unregisterOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) = Unit
+
+    private inner class FakeEditor : SharedPreferences.Editor {
+        private val pending = mutableListOf<() -> Unit>()
+
+        override fun putString(key: String, value: String?) = apply { pending += { data[key] = value } }
+        override fun remove(key: String) = apply { pending += { data.remove(key) } }
+        override fun clear() = apply { pending += { data.clear() } }
+        override fun commit(): Boolean { apply(); return true }
+        override fun apply() { pending.forEach { it() }; pending.clear() }
+
+        override fun putStringSet(key: String, values: MutableSet<String>?) = this
+        override fun putInt(key: String, value: Int) = this
+        override fun putLong(key: String, value: Long) = this
+        override fun putFloat(key: String, value: Float) = this
+        override fun putBoolean(key: String, value: Boolean) = this
+    }
+}
