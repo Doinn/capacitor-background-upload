@@ -36,7 +36,7 @@ data class UploadJob(
             bytesSent = json.optLong("bytesSent", 0),
             totalBytes = json.optLong("totalBytes", 0),
             httpStatus = if (json.has("httpStatus")) json.getInt("httpStatus") else null,
-            error = json.optString("error", null),
+            error = if (json.has("error") && !json.isNull("error")) json.getString("error") else null,
             filePath = if (json.has("filePath")) json.getString("filePath") else null,
             attempts = json.optInt("attempts", 0),
             createdAt = json.optLong("createdAt", 0),

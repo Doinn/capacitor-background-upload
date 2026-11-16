@@ -32,6 +32,16 @@ class UploadJobTest {
     }
 
     @Test
+    fun missingOrNullErrorReadsAsNull() {
+        val missing = UploadJob.fromJson(JSONObject("""{"jobId":"a","state":"queued"}"""))
+        val explicitNull = UploadJob.fromJson(JSONObject("""{"jobId":"a","state":"queued","error":null}"""))
+        val present = UploadJob.fromJson(JSONObject("""{"jobId":"a","state":"failed","error":"HTTP 404"}"""))
+        assertNull(missing.error)
+        assertNull(explicitNull.error)
+        assertEquals("HTTP 404", present.error)
+    }
+
+    @Test
     fun updateOnMissingRecordWritesNothing() {
         val store = UploadJobStore(FakePrefs())
         assertNull(store.update("gone") { it.bytesSent = 5 })
