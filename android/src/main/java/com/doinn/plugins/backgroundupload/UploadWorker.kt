@@ -60,6 +60,9 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
      * swallowed on purpose so the flow still reaches the transfer and its final write, which turns
      * the stop into a `queued` record. The transfer runs under `NonCancellable` so that block still
      * starts when the stop arrived before `withContext` was entered; it polls `isStopped` itself.
+     *
+     * The failure result carries the job id only for a record this write failed, because the
+     * plugin's observer needs the id to emit `uploadFailed`.
      */
     override suspend fun doWork(): Result {
         val jobId = inputData.getString(KEY_JOB_ID) ?: return Result.failure()
@@ -79,7 +82,6 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
                     }
                 }
             }
-            // The observer needs the job id to emit uploadFailed, and only for a record this write failed.
             if (marked) Result.failure(workDataOf(KEY_JOB_ID to jobId)) else Result.failure()
         }
     }
@@ -126,6 +128,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         val url = inputData.getString(KEY_URL) ?: throw IllegalStateException("missing url")
         val headersJson = JSONObject(inputData.getString(KEY_HEADERS) ?: "{}")
         val (length, contentType) = resolveFileMeta(filePath)
+        if (length == 0L) throw IllegalStateException("empty file")
         val headers = mutableMapOf<String, String>()
         headersJson.keys().forEach { key -> headers[key] = headersJson.getString(key) }
         if (headers.keys.none { it.equals("Content-Type", ignoreCase = true) }) {

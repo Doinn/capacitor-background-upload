@@ -14,6 +14,7 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.File
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 @CapacitorPlugin(name = "BackgroundUpload")
@@ -26,7 +27,7 @@ class BackgroundUploadPlugin : Plugin() {
     private lateinit var store: UploadJobStore
     private var observer: Observer<List<WorkInfo>>? = null
     private var workLiveData: LiveData<List<WorkInfo>>? = null
-    private val notifiedTerminal = mutableSetOf<String>()
+    private val notifiedTerminal: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val prepareExecutor = Executors.newSingleThreadExecutor()
 
     override fun load() {
@@ -173,28 +174,32 @@ class BackgroundUploadPlugin : Plugin() {
         }
     }
 
+    /** Reads the store on the calling thread: its reads are thread-safe and must not queue behind a long prepare. */
     @PluginMethod
     fun getJobs(call: PluginCall) {
-        prepareExecutor.execute {
-            val jobs = JSArray()
-            store.getAll().forEach { job ->
-                val obj = JSObject()
-                obj.put("jobId", job.jobId)
-                obj.put("state", job.state)
-                obj.put("bytesSent", job.bytesSent)
-                obj.put("totalBytes", job.totalBytes)
-                job.httpStatus?.let { obj.put("httpStatus", it) }
-                job.error?.let { obj.put("error", it) }
-                obj.put("attempts", job.attempts)
-                obj.put("createdAt", job.createdAt)
-                jobs.put(obj)
-            }
-            val result = JSObject()
-            result.put("jobs", jobs)
-            call.resolve(result)
+        val jobs = JSArray()
+        store.getAll().forEach { job ->
+            val obj = JSObject()
+            obj.put("jobId", job.jobId)
+            obj.put("state", job.state)
+            obj.put("bytesSent", job.bytesSent)
+            obj.put("totalBytes", job.totalBytes)
+            job.httpStatus?.let { obj.put("httpStatus", it) }
+            job.error?.let { obj.put("error", it) }
+            obj.put("attempts", job.attempts)
+            obj.put("createdAt", job.createdAt)
+            jobs.put(obj)
         }
+        val result = JSObject()
+        result.put("jobs", jobs)
+        call.resolve(result)
     }
 
+    /**
+     * The record is removed before the work is cancelled, as in [clearAll]: a pending job may
+     * still own a replacement request, and a worker that finds its record gone neither writes it
+     * back nor schedules another.
+     */
     @PluginMethod
     fun acknowledge(call: PluginCall) {
         val jobId = call.getString("jobId")
@@ -202,16 +207,15 @@ class BackgroundUploadPlugin : Plugin() {
             call.reject("jobId is required")
             return
         }
-        // A pending job may still own a replacement request; it must not outlive its record.
-        WorkManager.getInstance(context).cancelUniqueWork(jobId)
         val job = store.get(jobId)
+        store.remove(jobId)
+        notifiedTerminal.remove(jobId)
+        WorkManager.getInstance(context).cancelUniqueWork(jobId)
         job?.filePath?.let { path ->
             if (UploadFilePreparer.isInsideCacheDir(context, path)) {
                 runCatching { File(path).delete() }
             }
         }
-        store.remove(jobId)
-        notifiedTerminal.remove(jobId)
         call.resolve()
     }
 
@@ -233,7 +237,7 @@ class BackgroundUploadPlugin : Plugin() {
                 val result = JSObject()
                 result.put("cancelled", removed.size)
                 result.put("deletedFiles", deletedFiles)
-                result.put("oldestAgeMs", if (oldest == null) JSONObject.NULL else System.currentTimeMillis() - oldest)
+                result.put("oldestAgeMs", if (oldest == null) JSONObject.NULL else maxOf(0L, System.currentTimeMillis() - oldest))
                 call.resolve(result)
             } catch (e: Exception) {
                 call.reject(e.message ?: "clearAll failed", e)
@@ -255,6 +259,10 @@ class BackgroundUploadPlugin : Plugin() {
         }
     }
 
+    /**
+     * The request is recorded first so a worker that ends as a retry while it is being stopped
+     * reads it and settles as cancelled instead of going back to the queue.
+     */
     @PluginMethod
     fun cancel(call: PluginCall) {
         val jobId = call.getString("jobId")
@@ -262,8 +270,6 @@ class BackgroundUploadPlugin : Plugin() {
             call.reject("jobId is required")
             return
         }
-        // The request is recorded first so a worker that ends as a retry while it is being
-        // stopped reads it and settles as cancelled instead of going back to the queue.
         store.update(jobId) { job ->
             job.cancelRequested = true
             if (job.state != "uploaded") {

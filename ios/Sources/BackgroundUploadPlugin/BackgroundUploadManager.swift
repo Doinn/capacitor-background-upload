@@ -60,8 +60,8 @@ public final class BackgroundUploadManager: NSObject {
         }
     }
 
-    /// Blocks (briefly) until `sweepZombieJobs()` has finished, so the first `getJobs`
-    /// call from the reconciler never races the sweep. Falls back to proceeding anyway
+    /// Blocks (briefly) until `sweepZombieJobs()` has finished, so neither `getJobs` nor
+    /// `ensureActivated()` ever races the sweep. Falls back to proceeding anyway
     /// after the timeout so a stuck/slow session can never hang the reconciler.
     public func waitForZombieSweep(timeout: DispatchTimeInterval = .seconds(3)) {
         _ = zombieSweepGroup.wait(timeout: .now() + timeout)
