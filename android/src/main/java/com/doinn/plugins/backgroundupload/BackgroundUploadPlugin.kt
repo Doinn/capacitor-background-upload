@@ -103,7 +103,8 @@ class BackgroundUploadPlugin : Plugin() {
                         filePath = filePath,
                         createdAt = System.currentTimeMillis(),
                         attempts = 0,
-                        cancelRequested = false
+                        cancelRequested = false,
+                        processToken = ProcessIdentity.token
                     )
                 )
                 notifiedTerminal.remove(jobId)

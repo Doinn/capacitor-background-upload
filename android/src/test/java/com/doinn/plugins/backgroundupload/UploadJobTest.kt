@@ -32,6 +32,16 @@ class UploadJobTest {
     }
 
     @Test
+    fun processTokenRoundTripsAndIsAbsentInOlderRecords() {
+        val withToken = UploadJob.fromJson(UploadJob("a", "queued", processToken = "t-1").toJson())
+        val older = UploadJob.fromJson(JSONObject("""{"jobId":"a","state":"queued","cancelRequested":false}"""))
+        val explicitNull = UploadJob.fromJson(JSONObject("""{"jobId":"a","state":"queued","processToken":null}"""))
+        assertEquals("t-1", withToken.processToken)
+        assertNull(older.processToken)
+        assertNull(explicitNull.processToken)
+    }
+
+    @Test
     fun missingOrNullErrorReadsAsNull() {
         val missing = UploadJob.fromJson(JSONObject("""{"jobId":"a","state":"queued"}"""))
         val explicitNull = UploadJob.fromJson(JSONObject("""{"jobId":"a","state":"queued","error":null}"""))

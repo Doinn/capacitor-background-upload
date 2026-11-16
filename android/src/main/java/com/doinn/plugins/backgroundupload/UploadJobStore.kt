@@ -14,7 +14,8 @@ data class UploadJob(
     var filePath: String? = null,
     var attempts: Int = 0,
     var createdAt: Long = 0,
-    var cancelRequested: Boolean = false
+    var cancelRequested: Boolean = false,
+    var processToken: String? = null
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("jobId", jobId)
@@ -27,6 +28,7 @@ data class UploadJob(
         put("attempts", attempts)
         put("createdAt", createdAt)
         put("cancelRequested", cancelRequested)
+        processToken?.let { put("processToken", it) }
     }
 
     companion object {
@@ -40,7 +42,8 @@ data class UploadJob(
             filePath = if (json.has("filePath")) json.getString("filePath") else null,
             attempts = json.optInt("attempts", 0),
             createdAt = json.optLong("createdAt", 0),
-            cancelRequested = json.optBoolean("cancelRequested", false)
+            cancelRequested = json.optBoolean("cancelRequested", false),
+            processToken = if (json.has("processToken") && !json.isNull("processToken")) json.getString("processToken") else null
         )
     }
 }

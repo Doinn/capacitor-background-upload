@@ -46,6 +46,7 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         const val CHANNEL_ID = "doinn_background_upload"
         const val NOTIFICATION_ID_BASE = 42918
         private const val REQUEUE_DELAY_SECONDS = 5L
+        const val ORPHANED_ERROR = "orphaned"
         private const val TAG = "UploadWorker"
     }
 
@@ -86,12 +87,37 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
         }
     }
 
+    /**
+     * The first thing a run does is read the record, and [decideStart] picks the step, in this
+     * order: a missing record ends the run; an `uploaded` record is reported as a success; a
+     * cancel request ends it quietly; any other `failed` record is reported as a failure; a record
+     * owned by another process, or with no owner, is written as `failed` with the error
+     * `orphaned`. None of these transfers, promotes to the foreground or schedules a replacement,
+     * and only the orphaned case writes the record. The check and the write happen in one store
+     * update, so a cancel or a clear that lands meanwhile cannot be overwritten.
+     */
     private suspend fun runJob(jobId: String): Result {
         val title = inputData.getString(KEY_NOTIFICATION_TITLE) ?: "Doinn"
 
-        val job = store.update(jobId) { if (!it.cancelRequested) it.state = "uploading" }
-            ?: return Result.failure()
-        if (job.cancelRequested) return Result.failure()
+        var start = StartDecision.RUN
+        val job = store.update(jobId) {
+            start = decideStart(it, ProcessIdentity.token)
+            when (start) {
+                StartDecision.RUN -> it.state = "uploading"
+                StartDecision.ORPHANED -> {
+                    it.state = "failed"
+                    it.error = ORPHANED_ERROR
+                }
+                else -> Unit
+            }
+        } ?: return Result.failure()
+        val output = workDataOf(KEY_JOB_ID to jobId)
+        when (start) {
+            StartDecision.ALREADY_UPLOADED -> return Result.success(output)
+            StartDecision.CANCEL_REQUESTED -> return Result.failure()
+            StartDecision.ALREADY_FAILED, StartDecision.ORPHANED -> return Result.failure(output)
+            StartDecision.RUN -> Unit
+        }
 
         val notificationId = NOTIFICATION_ID_BASE + (jobId.hashCode() and 0x7fffffff) % 10000
         try {
