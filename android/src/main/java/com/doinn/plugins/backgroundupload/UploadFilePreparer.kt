@@ -26,6 +26,7 @@ object UploadFilePreparer {
     private const val CACHE_SUBDIR = "doinn-bg-upload"
     private const val DEFAULT_JPEG_QUALITY = 0.8
     const val DEFAULT_ORPHAN_MAX_AGE_MS = 86_400_000L
+    private val ROTATING_ORIENTATIONS = ExifInterface.ORIENTATION_FLIP_HORIZONTAL..ExifInterface.ORIENTATION_ROTATE_270
 
     fun cacheDir(context: Context): File {
         val dir = File(context.cacheDir, CACHE_SUBDIR)
@@ -143,9 +144,11 @@ object UploadFilePreparer {
     }
 
     /**
-     * Returns null (never throws) when the source can't be decoded as an image, or when
-     * [shouldKeepSource] says re-encoding gained nothing, so callers fall back to the
-     * copy/original path instead of crashing on a mislabeled "image".
+     * Returns null (never throws) when the source can't be decoded as an image, when
+     * [shouldKeepSource] says re-encoding gained nothing, or when a required rotation could not
+     * be applied, so callers fall back to the copy/original path instead of crashing on a
+     * mislabeled "image" or uploading a sideways photo. Every bitmap allocated here is recycled
+     * and a partly written output file is deleted on any path that does not return it.
      */
     private fun tryDownscaleImage(
         context: Context,
@@ -155,6 +158,11 @@ object UploadFilePreparer {
         maxDimension: Int,
         quality: Double
     ): PreparedFile? {
+        var sampledBitmap: Bitmap? = null
+        var rotatedBitmap: Bitmap? = null
+        var scaledBitmap: Bitmap? = null
+        var outputFile: File? = null
+        var prepared: PreparedFile? = null
         return try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             openStream(context, filePath, isContentUri).use { BitmapFactory.decodeStream(it, null, bounds) }
@@ -163,39 +171,48 @@ object UploadFilePreparer {
             val decodeOptions = BitmapFactory.Options().apply {
                 inSampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, maxDimension)
             }
-            val sampledBitmap = openStream(context, filePath, isContentUri).use {
+            val sampled = openStream(context, filePath, isContentUri).use {
                 BitmapFactory.decodeStream(it, null, decodeOptions)
             } ?: return null
+            sampledBitmap = sampled
 
             val orientation = readOrientation(context, filePath, isContentUri)
-            val rotatedBitmap = applyExifRotation(sampledBitmap, orientation)
-            val scaledBitmap = scaleToMaxDimension(rotatedBitmap, maxDimension)
+            val rotated = applyExifRotation(sampled, orientation)
+            if (mustFallBackToCopy(orientation, rotationApplied = rotated != null)) return null
+            if (rotated == null) return null
+            rotatedBitmap = rotated
+            val scaled = scaleToMaxDimension(rotated, maxDimension)
+            scaledBitmap = scaled
 
-            val outputFile = uniqueFile(context, filePath, ".jpg")
-            FileOutputStream(outputFile).use { out ->
+            val output = uniqueFile(context, filePath, ".jpg")
+            outputFile = output
+            FileOutputStream(output).use { out ->
                 val quality100 = Math.round(quality * 100).toInt().coerceIn(1, 100)
-                scaledBitmap.compress(Bitmap.CompressFormat.JPEG, quality100, out)
+                scaled.compress(Bitmap.CompressFormat.JPEG, quality100, out)
             }
-            val outputWidth = scaledBitmap.width
-            val outputHeight = scaledBitmap.height
-            if (scaledBitmap !== rotatedBitmap) scaledBitmap.recycle()
-            if (rotatedBitmap !== sampledBitmap) rotatedBitmap.recycle()
-            sampledBitmap.recycle()
+            val outputWidth = scaled.width
+            val outputHeight = scaled.height
+            releaseBitmaps(sampled, rotated, scaled)
 
-            copyExif(context, filePath, isContentUri, outputFile, outputWidth, outputHeight)
+            copyExif(context, filePath, isContentUri, output, outputWidth, outputHeight)
 
             val sourceBytes = sourceLength(context, filePath, isContentUri)
-            if (shouldKeepSource(sourceMimeType, sourceBytes, outputFile.length())) {
-                outputFile.delete()
-                return null
-            }
+            if (shouldKeepSource(sourceMimeType, sourceBytes, output.length())) return null
 
-            PreparedFile(outputFile.absolutePath, outputFile.length(), "image/jpeg")
+            prepared = PreparedFile(output.absolutePath, output.length(), "image/jpeg")
+            prepared
         } catch (e: Exception) {
             null
         } catch (e: OutOfMemoryError) {
             null
+        } finally {
+            releaseBitmaps(sampledBitmap, rotatedBitmap, scaledBitmap)
+            if (prepared == null) outputFile?.delete()
         }
+    }
+
+    private fun releaseBitmaps(vararg bitmaps: Bitmap?) {
+        bitmaps.forEach { if (it != null && !it.isRecycled) it.recycle() }
     }
 
     /**
@@ -267,7 +284,24 @@ object UploadFilePreparer {
         }
     }
 
-    private fun applyExifRotation(bitmap: Bitmap, orientation: Int): Bitmap {
+    /** True when the EXIF orientation describes pixels that must be turned or flipped to display upright. */
+    fun requiresRotation(orientation: Int): Boolean = orientation in ROTATING_ORIENTATIONS
+
+    /**
+     * A rotation that was needed but could not be applied means the pixels cannot be re-encoded
+     * with the orientation reset to normal, so the downscale must give way to the byte copy,
+     * which keeps both the original pixels and the original orientation tag.
+     */
+    fun mustFallBackToCopy(orientation: Int, rotationApplied: Boolean): Boolean =
+        requiresRotation(orientation) && !rotationApplied
+
+    /**
+     * Returns [bitmap] itself when the orientation needs no rotation, the rotated copy otherwise,
+     * and null when a needed rotation ran out of memory, so the caller never mistakes an
+     * unrotated bitmap for a rotated one.
+     */
+    private fun applyExifRotation(bitmap: Bitmap, orientation: Int): Bitmap? {
+        if (!requiresRotation(orientation)) return bitmap
         val matrix = Matrix()
         when (orientation) {
             ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
@@ -283,12 +317,11 @@ object UploadFilePreparer {
                 matrix.postRotate(270f)
                 matrix.postScale(-1f, 1f)
             }
-            else -> return bitmap
         }
         return try {
             Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
         } catch (e: OutOfMemoryError) {
-            bitmap
+            null
         }
     }
 

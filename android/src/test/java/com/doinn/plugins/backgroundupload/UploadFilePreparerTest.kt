@@ -66,4 +66,21 @@ class UploadFilePreparerTest {
         assertTrue(UploadFilePreparer.shouldKeepSource("IMAGE/JPEG", 1_000L, 2_000L))
         assertTrue(UploadFilePreparer.shouldKeepSource("image/jpeg; charset=binary", 1_000L, 2_000L))
     }
+
+    @Test
+    fun everyNonNormalOrientationRequiresRotation() {
+        (2..8).forEach { assertTrue("for $it", UploadFilePreparer.requiresRotation(it)) }
+    }
+
+    @Test
+    fun normalUndefinedAndUnknownOrientationsRequireNoRotation() {
+        listOf(0, 1, 9, -1, 100).forEach { assertFalse("for $it", UploadFilePreparer.requiresRotation(it)) }
+    }
+
+    @Test
+    fun downscaleFallsBackOnlyWhenARequiredRotationWasNotApplied() {
+        assertTrue(UploadFilePreparer.mustFallBackToCopy(orientation = 6, rotationApplied = false))
+        assertFalse(UploadFilePreparer.mustFallBackToCopy(orientation = 6, rotationApplied = true))
+        assertFalse(UploadFilePreparer.mustFallBackToCopy(orientation = 1, rotationApplied = false))
+    }
 }
