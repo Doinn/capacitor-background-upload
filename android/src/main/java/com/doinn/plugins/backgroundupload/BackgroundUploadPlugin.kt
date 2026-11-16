@@ -13,6 +13,7 @@ import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.File
+import org.json.JSONObject
 import java.util.concurrent.Executors
 
 @CapacitorPlugin(name = "BackgroundUpload")
@@ -201,6 +202,8 @@ class BackgroundUploadPlugin : Plugin() {
             call.reject("jobId is required")
             return
         }
+        // A pending job may still own a replacement request; it must not outlive its record.
+        WorkManager.getInstance(context).cancelUniqueWork(jobId)
         val job = store.get(jobId)
         job?.filePath?.let { path ->
             if (UploadFilePreparer.isInsideCacheDir(context, path)) {
@@ -210,6 +213,46 @@ class BackgroundUploadPlugin : Plugin() {
         store.remove(jobId)
         notifiedTerminal.remove(jobId)
         call.resolve()
+    }
+
+    /**
+     * Called once per JavaScript start, before any upload: no upload survives that restart, so
+     * everything left over is cancelled and deleted. The store is cleared first so a worker in the
+     * middle of a chunk finds its record gone at its next update, stops, and neither writes itself
+     * back nor schedules a replacement; only then is the work cancelled and the files deleted.
+     */
+    @PluginMethod
+    fun clearAll(call: PluginCall) {
+        prepareExecutor.execute {
+            try {
+                val removed = store.clear()
+                notifiedTerminal.clear()
+                WorkManager.getInstance(context).cancelAllWorkByTag(WORK_TAG)
+                val deletedFiles = UploadFilePreparer.deleteAllIn(UploadFilePreparer.cacheDir(context))
+                val oldest = removed.map { it.createdAt }.filter { it > 0 }.minOrNull()
+                val result = JSObject()
+                result.put("cancelled", removed.size)
+                result.put("deletedFiles", deletedFiles)
+                result.put("oldestAgeMs", if (oldest == null) JSONObject.NULL else System.currentTimeMillis() - oldest)
+                call.resolve(result)
+            } catch (e: Exception) {
+                call.reject(e.message ?: "clearAll failed", e)
+            }
+        }
+    }
+
+    @PluginMethod
+    fun discardPreparedFile(call: PluginCall) {
+        val path = call.getString("path")
+        if (path == null) {
+            call.reject("path is required")
+            return
+        }
+        prepareExecutor.execute {
+            val dir = UploadFilePreparer.cacheDir(context)
+            if (UploadFilePreparer.isInside(dir, path)) runCatching { File(path).delete() }
+            call.resolve()
+        }
     }
 
     @PluginMethod

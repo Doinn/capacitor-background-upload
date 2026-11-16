@@ -30,14 +30,27 @@ object UploadFilePreparer {
         return dir
     }
 
-    fun isInsideCacheDir(context: Context, path: String): Boolean {
+    fun isInsideCacheDir(context: Context, path: String): Boolean =
+        isInside(cacheDir(context), path)
+
+    /** True when [path] resolves, symlinks and `..` included, to [dir] itself or something below it. */
+    fun isInside(dir: File, path: String): Boolean {
         return try {
             val target = File(path).canonicalFile
-            val base = cacheDir(context).canonicalFile
+            val base = dir.canonicalFile
             target == base || target.path.startsWith(base.path + File.separator)
         } catch (e: Exception) {
             false
         }
+    }
+
+    /** Deletes every regular file directly in [dir] and returns how many were removed; 0 when [dir] is missing. */
+    fun deleteAllIn(dir: File): Int {
+        var deleted = 0
+        dir.listFiles()?.forEach { file ->
+            if (file.isFile && file.delete()) deleted++
+        }
+        return deleted
     }
 
     /**
