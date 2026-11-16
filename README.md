@@ -57,7 +57,7 @@ await BackgroundUpload.enqueueUpload({
 
 ### `getJobs()`
 
-Returns all persisted jobs. This is the reliable way to learn the state of a job; use it for boot reconciliation after an app restart.
+Returns all persisted jobs. This is the reliable way to learn the state of a job while the app runs. On Android, work left over from an earlier start of the app is cleared by `clearAll`, not reconciled through this call.
 
 ```js
 const { jobs } = await BackgroundUpload.getJobs()
@@ -77,9 +77,9 @@ On iOS it removes the record and deletes the prepared file but does not cancel a
 
 ### `cancel({ jobId })`
 
-Marks the job `failed` with the error `cancelled` and cancels its work. A job that is already `uploaded` keeps that state. On Android this is the only way a job ends as `failed` with the error `cancelled`.
+Marks the job `failed` with the error `cancelled` and cancels its work. A job that is already `uploaded` keeps that state. A transfer whose last bytes were already sent can still finish as `uploaded` after the call; the app must treat that upload as unconfirmed and verify it with the backend. On Android this is the only way a job ends as `failed` with the error `cancelled`.
 
-On iOS it only cancels the running `URLSession` task. The record then fails through the normal completion path with the system's error message for a cancelled request, not the text `cancelled`, and `uploadFailed` is emitted.
+On iOS it only cancels the running `URLSession` task. The record then fails through the normal completion path with the error message the system reports for a cancelled request, and `uploadFailed` is emitted.
 
 ### `cleanupOrphans({ maxAgeMs? })`
 
@@ -102,7 +102,7 @@ Meant to be called once per JavaScript start, before any upload. It removes ever
 | `queued` | Not transferring. This covers a job that has not started, one waiting for the network, and one waiting between attempts. |
 | `uploading` | A transfer is running. |
 | `uploaded` | The server answered with a 2xx status. On Android it can also be reached with `httpStatus` 308, when the resume probe finds the whole file already committed. |
-| `failed` | The job ended with an error, see `error` and `httpStatus`. |
+| `failed` | The job ended with an error, see `error` and `httpStatus`. On Android, a job whose process died before it finished ends as `failed` with the error `orphaned`: a job belongs to the process that enqueued it. |
 
 On iOS a job is `uploading` from the moment it is enqueued and never `queued`. A job whose task did not survive a force-quit is marked `failed` with the error `orphaned (app terminated)` on the first plugin call after launch.
 
@@ -112,7 +112,7 @@ On iOS a job is `uploading` from the moment it is enqueued and never `queued`. A
 - Every other HTTP status, including all other 4xx codes, fails the job at once, and so do errors that are not network errors, such as a missing file or a revoked `content://` grant.
 - A loss of connectivity does not consume an attempt. The job returns to `queued` and runs again once a network is available.
 - A stop by the system does not consume an attempt either. The job returns to `queued`.
-- A job that returns to `queued` without consuming an attempt is re-run about 5 seconds after it is rescheduled, once the network constraint is met. A counted retry instead waits on WorkManager's linear backoff of 10 seconds times the run count of the work request. For GCS resumable sessions the transfer continues from the committed offset.
+- A job that returns to `queued` without consuming an attempt is re-run 5 seconds after it is rescheduled, once the network constraint is met. While consecutive runs move no byte, the wait doubles (10, 20, 40, 80, 160 seconds) up to 300 seconds, and a run that sends more bytes than it started with resets it to 5 seconds. A counted retry instead waits on WorkManager's linear backoff of 10 seconds times the run count of the work request. For GCS resumable sessions the transfer continues from the committed offset.
 
 ### Events
 
