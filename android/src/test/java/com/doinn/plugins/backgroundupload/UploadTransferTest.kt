@@ -97,10 +97,86 @@ class UploadTransferTest {
     @Test fun status429And408AreRetry() {
         server.enqueue(MockResponse().setResponseCode(429))
         assertEquals(TransferOutcome.Retry(429, "HTTP 429"), run(false))
-        // OkHttp silently replays a request once after a 408, so the server must answer twice.
-        server.enqueue(MockResponse().setResponseCode(408))
         server.enqueue(MockResponse().setResponseCode(408))
         assertEquals(TransferOutcome.Retry(408, "HTTP 408"), run(false))
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test fun status503WithRetryAfterZeroIsNotReplayed() {
+        server.enqueue(MockResponse().setResponseCode(503).setHeader("Retry-After", "0"))
+        server.enqueue(MockResponse().setResponseCode(200))
+        assertEquals(TransferOutcome.Retry(503, "HTTP 503"), run(false))
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun probeAnswered503IsRetryWithoutBody() {
+        server.enqueue(MockResponse().setResponseCode(503))
+        assertEquals(TransferOutcome.Retry(503, "HTTP 503"), run(true))
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun probeAnswered404IsFailWithoutBody() {
+        server.enqueue(MockResponse().setResponseCode(404))
+        assertEquals(TransferOutcome.Fail(404, "HTTP 404"), run(true))
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun malformedRangeRestartsFromZero() {
+        server.enqueue(MockResponse().setResponseCode(308).setHeader("Range", "bytes=0-99999999999999999999999"))
+        server.enqueue(MockResponse().setResponseCode(200))
+        assertEquals(TransferOutcome.Success(200), run(true))
+        server.takeRequest()
+        assertEquals(total, server.takeRequest().bodySize)
+    }
+
+    @Test fun committedOffsetEqualToTotalIsSuccessWithoutBody() {
+        server.enqueue(MockResponse().setResponseCode(308).setHeader("Range", "bytes=0-${total - 1}"))
+        assertEquals(TransferOutcome.Success(308), run(true))
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun committedOffsetBeyondTotalFails() {
+        server.enqueue(MockResponse().setResponseCode(308).setHeader("Range", "bytes=0-$total"))
+        assertEquals(TransferOutcome.Fail(null, "committed offset beyond file size"), run(true))
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun nonIoExceptionFromOpenStreamIsFail() {
+        server.enqueue(MockResponse().setResponseCode(200))
+        val failing = request(false).copy(openStream = { throw SecurityException("grant revoked") })
+        val outcome = UploadTransfer(client) { network }.run(failing, { cancelled }) {}
+        assertEquals(TransferOutcome.Fail(null, "grant revoked"), outcome)
+    }
+
+    @Test fun fileShorterThanCommittedOffsetIsFail() {
+        server.enqueue(MockResponse().setResponseCode(308).setHeader("Range", "bytes=0-262143"))
+        val short = request(true).copy(openStream = { ByteArrayInputStream(ByteArray(1000)) })
+        val outcome = UploadTransfer(client) { network }.run(short, { cancelled }) {}
+        assertEquals(TransferOutcome.Fail(null, "file shorter than committed offset"), outcome)
+    }
+
+    @Test fun alreadyCancelledSendsNothing() {
+        cancelled = true
+        assertEquals(TransferOutcome.Cancelled, run(true))
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test fun cancelAfterLastByteLetsTheResponseDecide() {
+        server.enqueue(MockResponse().setResponseCode(200))
+        val outcome = run(false) { if (it == total) cancelled = true }
+        assertEquals(TransferOutcome.Success(200), outcome)
+    }
+
+    @Test fun callerContentTypeIsSentAndContentRangeIsComputed() {
+        server.enqueue(MockResponse().setResponseCode(308).setHeader("Range", "bytes=0-262143"))
+        server.enqueue(MockResponse().setResponseCode(200))
+        val headers = mapOf("Content-Type" to "video/mp4", "Content-Range" to "bytes 0-1/2")
+        val withHeaders = request(true).copy(headers = headers)
+        UploadTransfer(client) { network }.run(withHeaders, { cancelled }) {}
+        server.takeRequest()
+        val upload = server.takeRequest()
+        assertEquals("video/mp4", upload.getHeader("Content-Type"))
+        assertEquals("bytes 262144-614399/614400", upload.getHeader("Content-Range"))
     }
 
     @Test fun status404IsFail() {
