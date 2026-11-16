@@ -5,8 +5,9 @@
   "main": "src/index.js",
   "files": [
     "src/",
-    "ios/",
-    "android/",
+    "android/src/main/",
+    "android/build.gradle",
+    "ios/Sources/",
     "*.podspec"
   ],
   "author": "Doinn",
