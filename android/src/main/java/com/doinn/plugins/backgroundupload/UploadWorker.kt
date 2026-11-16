@@ -69,13 +69,18 @@ class UploadWorker(appContext: Context, params: WorkerParameters) :
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Unexpected failure: ${e.javaClass.simpleName}")
+            var marked = false
             runCatching {
                 store.update(jobId) {
-                    it.state = "failed"
-                    it.error = e.javaClass.simpleName
+                    if (it.state != "uploaded" && !it.cancelRequested) {
+                        it.state = "failed"
+                        it.error = e.javaClass.simpleName
+                        marked = true
+                    }
                 }
             }
-            Result.failure()
+            // The observer needs the job id to emit uploadFailed, and only for a record this write failed.
+            if (marked) Result.failure(workDataOf(KEY_JOB_ID to jobId)) else Result.failure()
         }
     }
 
